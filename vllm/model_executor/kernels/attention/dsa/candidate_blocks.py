@@ -10,6 +10,13 @@ from vllm.triton_utils import tl, triton
 # Opt-in exact replacement for ``scores.topk(k)`` + ``_store_candidates_kernel``
 # in select_candidate_blocks (see _candidate_topk_kernel).
 FAST_CANDIDATE_TOPK = os.environ.get("VLLM_DSV41_FAST_CANDIDATE_TOPK", "0") == "1"
+# kernel-agent patch (10/12), opt-in VLLM_KN_BOUNDED_CANDIDATE_MASK=1: apply_candidate_mask only rewrites each row's
+# [start, min(end, width)) columns -- the only ones the downstream top-k kernels read (topKPerRowPrefill / decode top-k
+# take per-row bounds; DeepGEMM logits are produced with clean_logits=False, so columns past a row's end are garbage
+# anyway). Values inside the range are bit-identical to the original sweep, which also wrote -inf over the whole
+# (max_model_len // ratio)-wide row. Graph-safe: fixed grid, per-row dynamic tile loop.
+BOUNDED_CANDIDATE_MASK = os.environ.get("VLLM_KN_BOUNDED_CANDIDATE_MASK", "0") == "1"
+_BOUNDED_MASK_PROGS = int(os.environ.get("VLLM_KN_BOUNDED_MASK_PROGS", "8"))
 
 
 @triton.jit
@@ -552,6 +559,44 @@ def _mask_candidates_kernel(
     )
 
 
+@triton.jit(do_not_specialize=["width", "nblocks"])
+def _mask_candidates_bounded_kernel(
+    logits,
+    starts,
+    ends,
+    flags,
+    stride_row,
+    stride_col,
+    stride_start,
+    stride_end,
+    width,
+    nblocks,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_STARTS: tl.constexpr,
+    ROW_REPEAT: tl.constexpr,
+    TILE: tl.constexpr,
+    NPROG: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    pid = tl.program_id(1)
+    start = tl.load(starts + row // ROW_REPEAT * stride_start) if HAS_STARTS else 0
+    end = tl.load(ends + row // ROW_REPEAT * stride_end)
+    stop = tl.minimum(end, width)
+    edge = tl.load(flags + row * (nblocks + 1) + nblocks)
+    ntiles = tl.cdiv(tl.maximum(stop - start, 0), TILE)
+    for t in range(pid, ntiles, NPROG):
+        cols = start + t * TILE + tl.arange(0, TILE)
+        valid = cols < stop
+        block = (cols - start) // BLOCK_SIZE
+        keep = tl.load(flags + row * (nblocks + 1) + block, valid, other=0)
+        keep = (keep != 0) | ((cols == width - 1) & (edge != 0))
+        tl.store(
+            logits + row * stride_row + cols * stride_col,
+            -float("inf"),
+            valid & ~keep,
+        )
+
+
 def select_candidate_blocks(
     logits: torch.Tensor,
     row_ks: torch.Tensor | None,
@@ -664,6 +709,25 @@ def apply_candidate_mask(
         row_ks is not None,
         row_repeat,
     )
+    if BOUNDED_CANDIDATE_MASK:
+        nprog = max(1, min(_BOUNDED_MASK_PROGS, triton.cdiv(width, 1024)))
+        _mask_candidates_bounded_kernel[(rows, nprog)](
+            logits,
+            row_ks,
+            row_ke,
+            flags,
+            *logits.stride(),
+            start_stride,
+            row_ke.stride(0),
+            width,
+            nblocks,
+            block_size,
+            row_ks is not None,
+            row_repeat,
+            1024,
+            nprog,
+        )
+        return
     _mask_candidates_kernel[(rows, triton.cdiv(width, 1024))](
         logits,
         row_ks,
