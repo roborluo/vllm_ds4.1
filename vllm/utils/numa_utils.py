@@ -418,6 +418,12 @@ def _get_numactl_enginecore_args(
     ``--numa-bind-cpus`` (its priority-core union across the shard nodes
     is also a safe superset by construction).
     """
+    # bofengl patch: keep EngineCore on one socket (TP0's) while workers bind per rank; the default binds it to the
+    # union of the shard's nodes (both sockets for TP4). Opt-in via VLLM_BOFENGL_ENGINECORE_NUMA=<node>.
+    ec_node = os.environ.get("VLLM_BOFENGL_ENGINECORE_NUMA", "")
+    if ec_node.isdigit():
+        logger.info("bofengl: binding EngineCore subprocess (local_rank=%s) to NUMA node %s", local_rank, ec_node)
+        return f"--cpunodebind={ec_node} --membind={ec_node}"
     shard_nodes = _get_enginecore_numa_nodes(parallel_config, dp_local_rank)
     membind_arg = ",".join(str(n) for n in shard_nodes)
 
