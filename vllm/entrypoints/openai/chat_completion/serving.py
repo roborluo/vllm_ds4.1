@@ -69,6 +69,60 @@ from vllm.utils.serial_utils import numpy2base64
 
 logger = init_logger(__name__)
 
+# ---- bofengl 10/12 patch (dep agent): conversation affinity across vLLM's internal DP ranks ----------------------------
+# vLLM's DP load balancer (DPLBAsyncMPClient) places every request on the least-loaded engine, so the turns of one
+# multi-turn conversation bounce between DP ranks and lose their per-rank prefix cache. With VLLM_BOFENGL_DP_AFFINITY=1
+# each conversation (key = sha1 of its first user message, fixed for an append-only history) is pinned to one DP rank:
+# the first turn goes to the rank with the fewest active conversations (seen within VLLM_BOFENGL_DP_AFFINITY_TTL s),
+# later turns follow the pin. The map is a sqlite db shared by all API-server processes of this server (BEGIN IMMEDIATE
+# serializes the read-modify-write). Requests that carry an X-data-parallel-rank header keep it. Routing only: no change
+# to what is computed for a request.
+import hashlib as _bofengl_hl
+import os as _bofengl_os
+import sqlite3 as _bofengl_sqlite3
+import random as _bofengl_random
+
+_BOFENGL_DPAFF = _bofengl_os.environ.get("VLLM_BOFENGL_DP_AFFINITY", "0") == "1"
+_BOFENGL_DPAFF_TTL = float(_bofengl_os.environ.get("VLLM_BOFENGL_DP_AFFINITY_TTL", "120"))
+# Opt-in placement mode for NEW conversations (later turns always follow the pin). "count" (default, unchanged): fewest
+# active conversations. "prefill": balance active conversations AND the recent first-turn prefill load: score =
+# active/mean(active) + prefill/mean(prefill), prefill = sum of the first-turn prompt weights (message chars excluding the
+# system message, a proxy for uncached tokens) placed on the rank within VLLM_BOFENGL_DP_AFFINITY_PWIN s (default 30);
+# random tie-break.
+_BOFENGL_DPAFF_MODE = _bofengl_os.environ.get("VLLM_BOFENGL_DP_AFFINITY_MODE", "count")
+_BOFENGL_DPAFF_PWIN = float(_bofengl_os.environ.get("VLLM_BOFENGL_DP_AFFINITY_PWIN", "30"))
+
+
+def _bofengl_first_turn_weight(request) -> float:
+    w = 0
+    for m in getattr(request, "messages", None) or []:
+        role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+        if role == "system":
+            continue
+        c = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
+        if isinstance(c, str):
+            w += len(c)
+        elif isinstance(c, list):
+            w += sum(len(p.get("text", "") or "") if isinstance(p, dict) else 0 for p in c)
+        tc = m.get("tool_calls") if isinstance(m, dict) else getattr(m, "tool_calls", None)
+        if tc:
+            w += len(str(tc))
+    return float(max(w, 1))
+
+
+def _bofengl_conv_key(request) -> str | None:
+    for m in getattr(request, "messages", None) or []:
+        role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+        if role != "user":
+            continue
+        c = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
+        if isinstance(c, list):
+            c = "\n".join((p.get("text", "") if isinstance(p, dict) else str(getattr(p, "text", ""))) for p in c)
+        if isinstance(c, str) and c:
+            return _bofengl_hl.sha1(c.encode("utf-8", "surrogatepass")).hexdigest()[:20]
+        return None
+    return None
+
 
 def _get_mm_token_counts(engine_input: EngineInput) -> dict[str, int]:
     """Sum per-modality placeholder tokens from ``mm_placeholders``.
@@ -255,6 +309,70 @@ class OpenAIServingChat(GenerateBaseServing):
 
         return await self.online_renderer.render_chat(request)
 
+    def _bofengl_dp_affinity(self, request) -> int | None:
+        """bofengl patch: pinned DP rank of this request's conversation (None -> vLLM's own load balancer)."""
+        try:
+            st = getattr(self, "_bofengl_dpaff_state", None)
+            if st is None:
+                dp = int(self.engine_client.vllm_config.parallel_config.data_parallel_size)
+                path = _bofengl_os.environ.get("VLLM_BOFENGL_DP_AFFINITY_DB") or (
+                    f"/tmp/bofengl-dpaff-{_bofengl_os.environ.get('SLURM_JOB_ID', '0')}-{_bofengl_os.getppid()}.db")
+                con = _bofengl_sqlite3.connect(path, timeout=30, isolation_level=None, check_same_thread=False)
+                con.execute("PRAGMA journal_mode=WAL")
+                con.execute("CREATE TABLE IF NOT EXISTS conv (k TEXT PRIMARY KEY, r INTEGER, t REAL)")
+                con.execute("CREATE TABLE IF NOT EXISTS firsts (r INTEGER, t REAL, w REAL)")
+                st = self._bofengl_dpaff_state = {"dp": dp, "con": con, "n": 0, "new": 0, "path": path}
+                logger.warning("bofengl dp-affinity: on, dp=%d ttl=%.0fs mode=%s pwin=%.0fs db=%s", dp, _BOFENGL_DPAFF_TTL, _BOFENGL_DPAFF_MODE, _BOFENGL_DPAFF_PWIN, path)
+            if st["dp"] <= 1:
+                return None
+            key = _bofengl_conv_key(request)
+            if key is None:
+                return None
+            con, now = st["con"], time.time()
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                row = con.execute("SELECT r FROM conv WHERE k=?", (key,)).fetchone()
+                if row is not None:
+                    rank = int(row[0])
+                    con.execute("UPDATE conv SET t=? WHERE k=?", (now, key))
+                else:
+                    cnt = dict(con.execute("SELECT r, COUNT(*) FROM conv WHERE t>? GROUP BY r",
+                                           (now - _BOFENGL_DPAFF_TTL,)).fetchall())
+                    h = int(key[:8], 16)
+                    if _BOFENGL_DPAFF_MODE == "prefill":
+                        pw = dict(con.execute("SELECT r, SUM(w) FROM firsts WHERE t>? GROUP BY r",
+                                              (now - _BOFENGL_DPAFF_PWIN,)).fetchall())
+                        dp = st["dp"]
+                        ma = max(1e-9, sum(cnt.get(r, 0) for r in range(dp)) / dp)
+                        mp = max(1e-9, sum(pw.get(r, 0.0) for r in range(dp)) / dp)
+                        tie = _bofengl_random.random()
+                        rank = min(range(dp), key=lambda r: (cnt.get(r, 0) / ma + pw.get(r, 0.0) / mp,
+                                                             (r + int(tie * dp)) % dp))
+                        con.execute("INSERT INTO firsts VALUES (?,?,?)", (rank, now, _bofengl_first_turn_weight(request)))
+                        if st["new"] % 200 == 0:
+                            con.execute("DELETE FROM firsts WHERE t<?", (now - 10 * _BOFENGL_DPAFF_PWIN,))
+                    else:
+                        rank = min(range(st["dp"]), key=lambda r: (cnt.get(r, 0), (r - h) % st["dp"]))
+                    con.execute("INSERT INTO conv VALUES (?,?,?)", (key, rank, now))
+                    st["new"] += 1
+                con.execute("COMMIT")
+            except BaseException:
+                con.execute("ROLLBACK")
+                raise
+            st["n"] += 1
+            if st["n"] % 500 == 0:
+                cnt = dict(con.execute("SELECT r, COUNT(*) FROM conv WHERE t>? GROUP BY r",
+                                       (now - _BOFENGL_DPAFF_TTL,)).fetchall())
+                logger.warning("bofengl dp-affinity: %d requests (%d new conversations) via this API server; "
+                               "active conversations per rank %s", st["n"], st["new"],
+                               [cnt.get(r, 0) for r in range(st["dp"])])
+            return rank
+        except Exception as e:  # never fail a request over routing
+            if not getattr(self, "_bofengl_dpaff_err", False):
+                self._bofengl_dpaff_err = True
+                logger.warning("bofengl dp-affinity: disabled for this request after error %r", e)
+            return None
+
     async def create_chat_completion(
         self,
         request: ChatCompletionRequest,
@@ -302,6 +420,8 @@ class OpenAIServingChat(GenerateBaseServing):
 
         # Extract data_parallel_rank from header (router can inject it)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
+        if data_parallel_rank is None and _BOFENGL_DPAFF:
+            data_parallel_rank = self._bofengl_dp_affinity(request)
 
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
