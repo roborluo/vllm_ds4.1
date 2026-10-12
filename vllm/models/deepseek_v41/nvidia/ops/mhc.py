@@ -34,7 +34,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 # GB200 TP4/FlashInfer improves through 16 tokens; larger screens tie or regress.
-MHC_OVERLAP_MAX_TOKENS = 16
+# kernel-agent patch (10/12): cap overridable via VLLM_KN_MHC_OVERLAP_MAX_TOKENS (default unchanged = 16).
+import os as _os
+MHC_OVERLAP_MAX_TOKENS = int(_os.environ.get("VLLM_KN_MHC_OVERLAP_MAX_TOKENS", "16"))
 
 # The fused all-reduce + mHC kernel of the overlap path, built once by
 # init_mhc_all_reduce.
@@ -59,8 +61,11 @@ def supports_mhc_overlap(vllm_config: VllmConfig) -> bool:
 def supports_mhc_all_reduce(vllm_config: VllmConfig) -> bool:
     parallel = vllm_config.parallel_config
     config = vllm_config.model_config.hf_config
+    # kernel-agent patch (10/12): VLLM_KN_MHC_AR_TPS (default "4" = unchanged) lists the TP sizes allowed to use the
+    # fused Lamport all-reduce + mHC (+ deferred MoE finalize) path; the CuTe DSL kernels are generic in tp.
+    _ar_tps = {int(t) for t in _os.environ.get("VLLM_KN_MHC_AR_TPS", "4").split(",") if t.strip()}
     if (
-        parallel.tensor_parallel_size != 4
+        parallel.tensor_parallel_size not in _ar_tps
         or parallel.enable_expert_parallel
         or config.hidden_size != 5120
         or config.hc_mult != 4
