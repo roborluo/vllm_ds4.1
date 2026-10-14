@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from functools import partial
@@ -94,6 +95,7 @@ from vllm.models.deepseek_v41.nvidia.flashinfer_sparse import (
 from vllm.models.deepseek_v41.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
@@ -119,6 +121,128 @@ if typing.TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 logger = init_logger(__name__)
+
+# Opt-in fused MoE top-k finalize + shared-expert add (VLLM_BOFENGL_FIN).
+# For TP-only models without MegaMoE and without the mHC all-reduce fusion (e.g.
+# a TP2 prefill worker), the TRTLLM-Gen MXFP4 experts stop after GEMM2 (the
+# existing deferred-finalize path) and one Triton kernel does the top-k weighted
+# reduction (fp32, k in order, FMA) + bf16 round + shared-expert add (fp32, bf16
+# round): the same arithmetic as flashinfer's finalizeKernelVecLoad followed by
+# `shared_output + fused_output`, so the output is bit-identical. The TP
+# all-reduce follows as before.
+# - VLLM_BOFENGL_FIN=1: fused path.
+# - VLLM_BOFENGL_FIN=3: shadow mode; runs both paths, logs bitwise differences
+#   on eager calls and returns the stock result.
+# - VLLM_BOFENGL_FIN_FMA (default 1): 0 uses separate mul + add roundings.
+# Unset = stock path.
+
+_FIN_MODE = os.environ.get("VLLM_BOFENGL_FIN", "0")
+_FIN_FMA = os.environ.get("VLLM_BOFENGL_FIN_FMA", "1") == "1"
+_FIN_SHADOW_LOGS = [0]
+_FIN_SHADOW_AGG = [0, 0, 0, 0, 0]
+
+
+@triton.jit
+def _finalize_shared_add_kernel(
+    perm_ptr,
+    w_ptr,
+    idx_ptr,
+    shared_ptr,
+    out_ptr,
+    H: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    USE_FMA: tl.constexpr,
+):
+    t = tl.program_id(0).to(tl.int64)
+    hb = tl.program_id(1)
+    cols = hb * BLOCK_H + tl.arange(0, BLOCK_H)
+    cmask = cols < H
+    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    for k in tl.static_range(TOPK):
+        p = tl.load(idx_ptr + t * TOPK + k)
+        w = tl.load(w_ptr + t * TOPK + k).to(tl.float32)
+        valid = p >= 0
+        x = tl.load(
+            perm_ptr + p.to(tl.int64) * H + cols, mask=cmask & valid, other=0.0
+        ).to(tl.float32)
+        if USE_FMA:
+            nxt = tl.fma(x, w, acc)
+        else:
+            # launched with enable_fp_fusion=False: separate mul + add roundings
+            nxt = acc + w * x
+        acc = tl.where(valid, nxt, acc)
+    fin = acc.to(tl.bfloat16)
+    s = tl.load(shared_ptr + t * H + cols, mask=cmask, other=0.0)
+    y = (s.to(tl.float32) + fin.to(tl.float32)).to(tl.bfloat16)
+    tl.store(out_ptr + t * H + cols, y, mask=cmask)
+
+
+def _finalize_shared_add(
+    routed, shared: torch.Tensor, use_fma: bool | None = None
+) -> torch.Tensor:
+    perm = routed.gemm2_permuted
+    w = routed.expert_weights
+    idx = routed.expanded_idx_to_permuted_idx
+    t, h = shared.shape
+    topk = idx.shape[1]
+    assert perm.dtype == torch.bfloat16 and shared.dtype == torch.bfloat16
+    assert perm.shape[1] == h and perm.is_contiguous() and shared.is_contiguous()
+    assert idx.dtype == torch.int32 and idx.is_contiguous() and w.is_contiguous()
+    use_fma = _FIN_FMA if use_fma is None else use_fma
+    out = torch.empty_like(shared)
+    if t == 0:
+        return out
+    block_h = 1024
+    grid = (t, triton.cdiv(h, block_h))
+    _finalize_shared_add_kernel[grid](
+        perm, w, idx, shared, out, H=h, TOPK=topk, BLOCK_H=block_h,
+        USE_FMA=use_fma, num_warps=4, enable_fp_fusion=use_fma,
+    )
+    return out
+
+
+def _ffn_finalize_shared_add(ffn, x: torch.Tensor, input_ids) -> torch.Tensor:
+    out = ffn.forward_unfinalized(x, input_ids)
+    y = _finalize_shared_add(out.routed, out.shared_output)
+    y = tensor_model_parallel_all_reduce(y)
+    if _FIN_MODE != "3":
+        return y
+    mc = ffn.experts.moe_config
+    mc._defer_moe_finalize = False
+    try:
+        ref = ffn(x, input_ids, None)
+    finally:
+        mc._defer_moe_finalize = True
+    if not torch.cuda.is_current_stream_capturing():
+        _FIN_SHADOW_LOGS[0] += 1
+        # second variant: the other FMA choice, same unfinalized inputs
+        y2 = tensor_model_parallel_all_reduce(
+            _finalize_shared_add(out.routed, out.shared_output, not _FIN_FMA)
+        )
+        a = ref.view(torch.int16)
+        stats = []
+        for yy in (y, y2):
+            b = yy.view(ref.shape).view(torch.int16)
+            stats.append(int((a != b).sum().item()))
+            stats.append(
+                float((ref.float() - yy.view(ref.shape).float()).abs().max().item())
+            )
+        agg = _FIN_SHADOW_AGG
+        agg[0] += 1
+        agg[1] += int(stats[0] > 0)
+        agg[2] += int(stats[2] > 0)
+        agg[3] += x.shape[0]
+        agg[4] = max(agg[4], x.shape[0])
+        if stats[0] > 0 or agg[0] % 200 == 1 or x.shape[0] >= 4096:
+            logger.info(
+                "VLLM_BOFENGL_FIN shadow: tokens=%d fma=%s mismatched=%d maxdiff=%g | "
+                "other(fma=%s) mismatched=%d maxdiff=%g | calls=%d bad_calls=%d "
+                "other_bad_calls=%d tokens_total=%d max_tokens=%d",
+                x.shape[0], _FIN_FMA, stats[0], stats[1], not _FIN_FMA,
+                stats[2], stats[3], agg[0], agg[1], agg[2], agg[3], agg[4],
+            )
+    return ref
 
 
 class DeepseekV4MoE(DeepseekV4MoEBase):
@@ -171,6 +295,20 @@ class DeepseekV4MoE(DeepseekV4MoEBase):
                     "up to %d tokens.",
                     MHC_OVERLAP_MAX_TOKENS,
                 )
+
+    def defer_finalize_for_shared_add(self) -> bool:
+        """VLLM_BOFENGL_FIN: leave the top-k reduction to _ffn_finalize_shared_add."""
+        moe_config = self.experts.moe_config
+        experts_cls = getattr(
+            self.experts.routed_experts.quant_method, "experts_cls", None
+        )
+        if (
+            experts_cls is TrtLlmMxfp4ExpertsModular
+            and self.experts.routed_scaling_factor == 1.0
+        ):
+            moe_config.defer_moe_finalize(-1)
+            return moe_config.use_deferred_moe_finalize
+        return False
 
     def defers_finalize(self, num_tokens: int) -> bool:
         return (
@@ -617,6 +755,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         if self.fuse_mhc_all_reduce and self.ffn.defers_finalize(x.shape[0]):
             # The next layer's first boundary finalizes it with the all-reduce.
             x = self.ffn.forward_unfinalized(x, input_ids)
+        elif getattr(
+            self, "_fused_finalize_shared_add", False
+        ) and self.ffn.defers_finalize(x.shape[0]):
+            x = _ffn_finalize_shared_add(self.ffn, x, input_ids)
         else:
             x = self.ffn(x, input_ids, mega_gate_metadata)
         if mhc_stream is not None:
@@ -753,6 +895,26 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 assert isinstance(successor, DeepseekV4DecoderLayer)
                 if successor.engram is None:
                     layer.ffn.defer_finalize()
+
+        if (
+            _FIN_MODE in ("1", "3")
+            and not self.fuse_mhc_all_reduce
+            and not self.use_mega_moe
+            and not self.use_sequence_parallel
+        ):
+            n_bf = 0
+            for layer in islice(self.layers, self.start_layer, self.end_layer):
+                if (
+                    isinstance(layer, DeepseekV4DecoderLayer)
+                    and layer.ffn.defer_finalize_for_shared_add()
+                ):
+                    layer._fused_finalize_shared_add = True
+                    n_bf += 1
+            logger.info(
+                "VLLM_BOFENGL_FIN=%s: fused top-k finalize + shared add on %d "
+                "MoE layers "
+                "(fma=%s).", _FIN_MODE, n_bf, _FIN_FMA,
+            )
 
         # Decoder-side SWA bounded replay: in eager prefill steps the layers past
         # the last KV source run on each request's trailing window only
