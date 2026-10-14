@@ -3,6 +3,7 @@
 """DeepseekV4 MLA Attention Layer"""
 
 import math
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from functools import cached_property
@@ -80,6 +81,112 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+# Opt-in fast Q zero-pad for the mega-attention layout (VLLM_BOFENGL_QPAD).
+# With mega attention the fused KV-insert op's Q half only copies the live heads
+# into the kernel's chunk-interleaved, head-padded layout and zero-fills the pad
+# heads (no norm / RoPE on that path). For large eager steps, run the op in its
+# KV-only mode (q_head_padded=0) and do the pad-copy in one bandwidth-bound
+# Triton kernel instead. Output bytes are identical (bf16 copy + +0.0 pads).
+# - VLLM_BOFENGL_QPAD=1: fresh output buffer, pads written every call.
+# - VLLM_BOFENGL_QPAD=2: persistent pre-zeroed buffer, live slots only.
+# - VLLM_BOFENGL_QPAD_MIN_TOKENS (default 1024): smallest step that takes it.
+# Unset = stock path. Never used during CUDA-graph capture.
+
+_QPAD_MODE = os.environ.get("VLLM_BOFENGL_QPAD", "0")
+_QPAD_MIN_TOKENS = int(os.environ.get("VLLM_BOFENGL_QPAD_MIN_TOKENS", "1024"))
+_QPAD_LOGGED = [False]
+# Initial persistent-buffer capacity (tokens) for VLLM_BOFENGL_QPAD=2; grows on demand.
+_QPAD_BUF_TOKENS = int(os.environ.get("VLLM_BOFENGL_QPAD_BUF_TOKENS", "16384"))
+
+
+@triton.jit
+def _qpad_interleaved_kernel(
+    q_ptr,
+    out_ptr,
+    n_rows,
+    LIVE: tl.constexpr,
+    PAD: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    # One row = one (token, 16-dim chunk): LIVE = live_heads*16 input elements,
+    # written to the first LIVE slots of a LIVE+PAD output row, zeros after.
+    pid = tl.program_id(0)
+    rows = pid.to(tl.int64) * BLOCK_R + tl.arange(0, BLOCK_R).to(tl.int64)
+    rmask = rows[:, None] < n_rows
+    cols = tl.arange(0, LIVE)
+    x = tl.load(q_ptr + rows[:, None] * LIVE + cols[None, :], mask=rmask)
+    obase = out_ptr + rows[:, None] * (LIVE + PAD)
+    tl.store(obase + cols[None, :], x, mask=rmask)
+    pcols = tl.arange(0, PAD)
+    tl.store(
+        obase + LIVE + pcols[None, :],
+        tl.zeros([BLOCK_R, PAD], dtype=x.dtype),
+        mask=rmask,
+    )
+
+
+@triton.jit
+def _qpad_live_slots_kernel(
+    q_ptr,
+    out_ptr,
+    n_rows,
+    LIVE: tl.constexpr,
+    PAD: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    # Persistent-buffer variant: pads were zeroed once at allocation and are
+    # never written, so only the live slots of each row are stored.
+    pid = tl.program_id(0)
+    rows = pid.to(tl.int64) * BLOCK_R + tl.arange(0, BLOCK_R).to(tl.int64)
+    rmask = rows[:, None] < n_rows
+    cols = tl.arange(0, LIVE)
+    x = tl.load(q_ptr + rows[:, None] * LIVE + cols[None, :], mask=rmask)
+    tl.store(out_ptr + rows[:, None] * (LIVE + PAD) + cols[None, :], x, mask=rmask)
+
+
+_QPAD_BUF: dict = {}
+
+
+def _qpad_interleaved_persistent(q: torch.Tensor, padded_heads: int) -> torch.Tensor:
+    """Same result as _qpad_interleaved, written into a persistent per-device
+    buffer whose pad slots stay +0.0 (zeroed once, never written). The returned
+    view is overwritten by the next layer's call; every consumer (this layer's
+    attention) runs before it on the same stream."""
+    n, h, d = q.shape
+    assert d == 512 and q.is_contiguous() and padded_heads > h
+    key = (q.device, q.dtype, h, padded_heads)
+    buf = _QPAD_BUF.get(key)
+    if buf is None or buf.shape[0] < n:
+        cap = max(n, _QPAD_BUF_TOKENS)
+        buf = torch.zeros((cap, padded_heads, d), dtype=q.dtype, device=q.device)
+        _QPAD_BUF[key] = buf
+    out = buf[:n]
+    live = h * 16
+    pad = (padded_heads - h) * 16
+    n_rows = n * (d // 16)
+    block_r = 4
+    grid = (triton.cdiv(n_rows, block_r),)
+    _qpad_live_slots_kernel[grid](q, out, n_rows, LIVE=live, PAD=pad, BLOCK_R=block_r,
+                           num_warps=4)
+    return out
+
+
+def _qpad_interleaved(q: torch.Tensor, padded_heads: int) -> torch.Tensor:
+    """[N, H, 512] chunk-interleaved Q -> [N, padded_heads, 512] chunk-interleaved,
+    pad heads (tail of every 16-dim chunk) = +0.0. Same bytes as the fused op's
+    Q half."""
+    n, h, d = q.shape
+    assert d == 512 and q.is_contiguous() and padded_heads > h
+    out = torch.empty((n, padded_heads, d), dtype=q.dtype, device=q.device)
+    live = h * 16
+    pad = (padded_heads - h) * 16
+    n_rows = n * (d // 16)
+    block_r = 4
+    grid = (triton.cdiv(n_rows, block_r),)
+    _qpad_interleaved_kernel[grid](q, out, n_rows, LIVE=live, PAD=pad, BLOCK_R=block_r,
+                          num_warps=4)
+    return out
 
 
 def _replace_layer_index(prefix: str, layer_id: int) -> str:
@@ -1041,6 +1148,42 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 and self.n_local_heads == self.padded_heads
                 else self.padded_heads
             )
+            if (
+                _QPAD_MODE in ("1", "2")
+                and pad_to != 0
+                and self.accepts_unnormed_unroped_query
+                and q.shape[0] >= _QPAD_MIN_TOKENS
+                and q.is_contiguous()
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                # KV-only launch of the same op, then the bandwidth-bound pad-copy.
+                torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+                    q,
+                    kv,
+                    swa_kv_cache_2d,
+                    swa_metadata.slot_mapping,
+                    positions,
+                    cos_sin_cache,
+                    0,
+                    self.eps,
+                    swa_metadata.block_size,
+                    False,  # apply_q_norm
+                    self.kv_mxfp8,
+                    False,  # apply_q_rope (attention kernel owns it)
+                    True,  # is_q_interleaved (unused without Q slots)
+                )
+                if not _QPAD_LOGGED[0]:
+                    _QPAD_LOGGED[0] = True
+                    logger.info(
+                        "VLLM_BOFENGL_QPAD=%s: KV-only fused insert + "
+                        "Triton Q pad-copy "
+                        "for eager steps >= %d tokens (%d -> %d heads).",
+                        _QPAD_MODE, _QPAD_MIN_TOKENS, self.n_local_heads,
+                        self.padded_heads,
+                    )
+                if _QPAD_MODE == "2":
+                    return _qpad_interleaved_persistent(q, self.padded_heads)
+                return _qpad_interleaved(q, self.padded_heads)
             q_padded = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                 q,
                 kv,
