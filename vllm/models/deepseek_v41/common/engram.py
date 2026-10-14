@@ -84,8 +84,11 @@ def _engram_lookup_thresholds(device: torch.device) -> tuple[int | None, int | N
     if current_platform.is_cuda() and current_platform.is_device_capability_family(
         100, device.index or 0
     ):
-        # Measured on GB200.
-        return 36864, 4096
+        # Measured on GB200. VLLM_BOFENGL_ENGRAM_INLINE_MIN overrides the inline
+        # threshold (tokens, max over DP ranks); a very large value keeps the
+        # lookups on the prefetch stream for every step. Unset keeps 4096.
+        inline_min = os.environ.get("VLLM_BOFENGL_ENGRAM_INLINE_MIN")
+        return 36864, (int(inline_min) if inline_min else 4096)
     # TODO: Add hand-tuned thresholds for other GPU families.
     return None, None
 
