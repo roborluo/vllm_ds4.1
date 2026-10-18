@@ -5,6 +5,15 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+# Columns one mask program covers per loop iteration.
+_MASK_TILE = 1024
+# Mask programs to spread over the rows of one launch: enough to keep the GPU
+# busy on fully live rows, without a program per tile of every short row. While
+# the tiles of all rows fit, every tile gets its own program, as in a full-width
+# sweep; past that, each row gets ceil(budget / rows) programs that stride over
+# its tiles.
+_MASK_PROGRAM_BUDGET = 16384
+
 
 @triton.jit
 def _max_with_nan(a, b):
@@ -88,21 +97,63 @@ def _candidate_flags_kernel(
     K: tl.constexpr,
     HAS_STARTS: tl.constexpr,
     ROW_REPEAT: tl.constexpr,
+    ends=None,
+    stride_end=0,
+    HAS_ENDS: tl.constexpr = False,
 ):
     row = tl.program_id(0).to(tl.int64)
-    offsets = tl.arange(0, 1024)
-    for tile in range(tl.cdiv(nblocks + 1, 1024)):
-        slots = tile * 1024 + offsets
-        tl.store(flags + row * (nblocks + 1) + slots, 0, slots <= nblocks)
+    row_flags = flags + row * (nblocks + 1)
     start = tl.load(starts + row // ROW_REPEAT * stride_start) if HAS_STARTS else 0
+    # Load the candidates first so that the load overlaps the clear below.
     cols = tl.arange(0, triton.next_power_of_2(K))
     block = tl.load(
         candidates + row * stride_row + cols * stride_col, cols < K, other=-1
-    ).to(tl.int64)
+    )
+    # Slot nblocks is the edge flag. Given the row ends, only the slots the
+    # mask reads are cleared: the blocks covering [start, min(end, width)) and
+    # the edge slot. Callers that pass no ends get every slot cleared.
+    if HAS_ENDS:
+        end = tl.load(ends + row // ROW_REPEAT * stride_end)
+        live = tl.cdiv(tl.maximum(tl.minimum(end, width) - start, 0), BLOCK_SIZE)
+    else:
+        live = nblocks
+    offsets = tl.arange(0, 1024)
+    for tile in range(tl.cdiv(live, 1024)):
+        slots = tile * 1024 + offsets
+        tl.store(row_flags + slots, 0, slots < live)
+    tl.store(row_flags + nblocks, 0)
     # Preserve the packed-column clamp for candidates beyond the logits width.
+    block = block.to(tl.int64)
     block = tl.where(start + block * BLOCK_SIZE >= width, nblocks, block)
     tl.debug_barrier()
-    tl.store(flags + row * (nblocks + 1) + block, 1, (cols < K) & (block >= 0))
+    # Candidates past the cleared blocks set slots that the mask never reads.
+    tl.store(row_flags + block, 1, (cols < K) & (block >= 0))
+
+
+@triton.jit
+def _mask_candidates_tile(
+    row_logits,
+    row_flags,
+    cols,
+    start,
+    stop,
+    edge,
+    stride_col,
+    width,
+    BLOCK_SIZE: tl.constexpr,
+):
+    written = cols < stop
+    valid = written & (cols >= start)
+    # Lanes that load have cols >= start, where the unsigned quotient is exact
+    # and cheaper than the signed one.
+    block = (cols - start).to(tl.uint32) // BLOCK_SIZE
+    keep = tl.load(row_flags + block, valid, other=0)
+    keep = (keep != 0) | ((cols == width - 1) & (edge != 0))
+    tl.store(
+        row_logits + cols * stride_col,
+        -float("inf"),
+        written & ~(valid & keep),
+    )
 
 
 @triton.jit(do_not_specialize=["width", "nblocks"])
@@ -123,19 +174,44 @@ def _mask_candidates_kernel(
     TILE: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
-    cols = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    row_logits = logits + row * stride_row
+    row_flags = flags + row * (nblocks + 1)
     start = tl.load(starts + row // ROW_REPEAT * stride_start) if HAS_STARTS else 0
     end = tl.load(ends + row // ROW_REPEAT * stride_end)
-    valid = (cols >= start) & (cols < end) & (cols < width)
-    block = (cols - start) // BLOCK_SIZE
-    keep = tl.load(flags + row * (nblocks + 1) + block, valid, other=0)
-    edge = tl.load(flags + row * (nblocks + 1) + nblocks)
-    keep = (keep != 0) | ((cols == width - 1) & (edge != 0))
-    tl.store(
-        logits + row * stride_row + cols * stride_col,
-        -float("inf"),
-        (cols < width) & ~(valid & keep),
-    )
+    edge = tl.load(row_flags + nblocks)
+    # Only columns below stop are written.
+    stop = tl.minimum(end, width)
+    if tl.num_programs(1) * TILE >= width:
+        # One program per tile, as in a full-width sweep.
+        cols = tl.program_id(1) * TILE + tl.arange(0, TILE)
+        _mask_candidates_tile(
+            row_logits,
+            row_flags,
+            cols,
+            start,
+            stop,
+            edge,
+            stride_col,
+            width,
+            BLOCK_SIZE,
+        )
+    else:
+        # The programs of a row stride over its tiles, so the grid does not
+        # depend on the row ends.
+        step = tl.num_programs(1) * TILE
+        for tile_start in range(tl.program_id(1) * TILE, stop, step):
+            cols = tile_start + tl.arange(0, TILE)
+            _mask_candidates_tile(
+                row_logits,
+                row_flags,
+                cols,
+                start,
+                stop,
+                edge,
+                stride_col,
+                width,
+                BLOCK_SIZE,
+            )
 
 
 def select_candidate_blocks(
@@ -197,7 +273,16 @@ def apply_candidate_mask(
     block_size: int,
     row_repeat: int = 1,
 ) -> None:
-    """Mask packed logits outside causal bounds and request-local candidates."""
+    """Mask packed logits outside causal bounds and request-local candidates.
+
+    Only each row's ``[0, min(end, width))`` is rewritten: -inf before
+    ``start`` and on blocks that are not candidates, the logit unchanged on
+    candidate blocks. Later columns are left as they are; every top-k that
+    follows reads a row only within that range. Decode logits rows are sized
+    for the longest context, so the cost follows each row's end, not the row
+    width. Row bounds are in packed column space; absent starts mean zero.
+    Decode rows share bounds in groups of ``row_repeat``.
+    """
     assert logits.is_cuda
     rows, width = logits.shape
     if not rows or not width:
@@ -217,8 +302,16 @@ def apply_candidate_mask(
         candidate_blocks.shape[1],
         row_ks is not None,
         row_repeat,
+        ends=row_ke,
+        stride_end=row_ke.stride(0),
+        HAS_ENDS=True,
     )
-    _mask_candidates_kernel[(rows, triton.cdiv(width, 1024))](
+    # The grid depends only on the logits shape, so a captured CUDA graph
+    # stays valid as the row ends change.
+    splits = min(
+        triton.cdiv(width, _MASK_TILE), triton.cdiv(_MASK_PROGRAM_BUDGET, rows)
+    )
+    _mask_candidates_kernel[(rows, splits)](
         logits,
         row_ks,
         row_ke,
@@ -231,5 +324,5 @@ def apply_candidate_mask(
         block_size,
         row_ks is not None,
         row_repeat,
-        1024,
+        _MASK_TILE,
     )

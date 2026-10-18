@@ -465,6 +465,9 @@ def test_candidate_kernels_preserve_packed_bounds_and_padding(
         include_self=True,
     )
     reference = logits.masked_fill((keep == 0) | ~valid, -torch.inf)
+    # Columns at or past each row's end are left as they were.
+    written = cols < ke[:, None]
+    reference = torch.where(written, reference, logits)
     apply_candidate_mask(logits, starts, ends, candidates, block_size, repeat)
     torch.testing.assert_close(logits, reference, rtol=0, atol=0, equal_nan=True)
     graph = torch.cuda.CUDAGraph()
@@ -476,7 +479,7 @@ def test_candidate_kernels_preserve_packed_bounds_and_padding(
         logits.fill_(3.0)
         graph.replay()
         keep = valid & (block >= 0) & ((cols - ks[:, None]) // block_size == block)
-        reference = torch.where(keep, 3.0, -torch.inf)
+        reference = torch.where(keep | ~written, 3.0, -torch.inf)
         torch.testing.assert_close(logits, reference, rtol=0, atol=0)
 
 
