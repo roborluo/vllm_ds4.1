@@ -55,11 +55,13 @@ DEVICE = current_platform.device_type
     "tp,ep,hidden,hc,multicast,expected",
     [
         (4, False, 5120, 4, 1, True),
-        (2, False, 5120, 4, 1, False),
+        (2, False, 5120, 4, 1, True),
+        (8, False, 5120, 4, 1, False),
         (4, True, 5120, 4, 1, False),
         (4, False, 4096, 4, 1, False),
         (4, False, 5120, 2, 1, False),
         (4, False, 5120, 4, 0, False),
+        (2, False, 5120, 4, 0, False),
     ],
 )
 def test_deepseek_v41_all_reduce_fusion_requires_kernel_support(

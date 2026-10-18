@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 # GB200 TP4/FlashInfer improves through 16 tokens; larger screens tie or regress.
+# The fused all-reduce takes the same cap on TP2.
 MHC_OVERLAP_MAX_TOKENS = 16
 
 # The fused all-reduce + mHC kernel of the overlap path, built once by
@@ -59,8 +60,10 @@ def supports_mhc_overlap(vllm_config: VllmConfig) -> bool:
 def supports_mhc_all_reduce(vllm_config: VllmConfig) -> bool:
     parallel = vllm_config.parallel_config
     config = vllm_config.model_config.hf_config
+    # The fused kernels take the TP size as a compile-time parameter; admit
+    # the sizes test_all_reduce_mhc_matches_unfused_path checks.
     if (
-        parallel.tensor_parallel_size != 4
+        parallel.tensor_parallel_size not in (2, 4)
         or parallel.enable_expert_parallel
         or config.hidden_size != 5120
         or config.hc_mult != 4

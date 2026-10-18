@@ -584,8 +584,11 @@ steps:
     - vllm/model_executor/kernels/linear/cute_dsl/gemm_rs_ar.py
     - vllm/cute_utils/
     - tests/kernels/test_gemm_rs_ar.py
+    - vllm/models/deepseek_v41/nvidia/ops/cute_dsl/
+    - tests/distributed/test_custom_all_reduce.py
   commands:
     - pytest -v -s tests/kernels/test_gemm_rs_ar.py
+    - pytest -v -s tests/distributed/test_custom_all_reduce.py -k all_reduce_mhc
   mirror:
     amd:
       label: ":amd: (MI355) GEMM-RS-AR"
