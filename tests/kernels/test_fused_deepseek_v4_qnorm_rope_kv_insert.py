@@ -716,6 +716,62 @@ def test_q_interleaved_is_orthogonal_to_norm_and_rope(
     torch.testing.assert_close(cache_inter, cache_major, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("num_tokens", [1, 17, 1024, 2049])
+def test_q_interleaved_pad_copy_matches_fused_q_half(num_tokens: int):
+    """The attention layer's Q pad-copy writes the op's interleaved Q half.
+
+    Large eager mega-attention steps launch the op with ``q_head_padded=0``
+    and build the padded Q with ``_pad_interleaved_q`` instead, so the two
+    together must leave the same KV cache and the same Q bytes, pads
+    included, in a NaN-filled buffer the copy has to overwrite entirely.
+    """
+    from vllm.models.deepseek_v41.attention import _pad_interleaved_q
+
+    torch.manual_seed(8)
+    device = "cuda"
+    dtype = torch.bfloat16
+    block_size, n_heads, q_head_padded = 64, 32, 64
+
+    q = torch.randn(num_tokens, n_heads, HEAD_DIM, dtype=dtype, device=device)
+    kv = torch.randn(num_tokens, HEAD_DIM, dtype=dtype, device=device)
+    positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    cos_sin_cache = make_cos_sin_cache(4096, ROPE_DIM, torch.float32, device)
+    num_blocks = (num_tokens + block_size - 1) // block_size + 1
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+
+    def insert(pad_to: int):
+        cache = torch.zeros(
+            num_blocks, block_size * V41_HEAD_BYTES, dtype=torch.uint8, device=device
+        )
+        out = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q,
+            kv,
+            cache,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            pad_to,
+            1e-6,
+            block_size,
+            False,  # apply_q_norm
+            True,  # kv_mxfp8
+            False,  # apply_q_rope
+            True,  # is_q_interleaved
+        )
+        return out, cache
+
+    want, want_cache = insert(q_head_padded)
+    no_q, cache = insert(0)
+    assert no_q.numel() == 0
+    torch.testing.assert_close(cache, want_cache, rtol=0, atol=0)
+
+    got = torch.full_like(want, float("nan"))
+    _pad_interleaved_q(q, got)
+    torch.testing.assert_close(
+        got.view(torch.int16), want.view(torch.int16), rtol=0, atol=0
+    )
+
+
 # ── Test 2b: DP padding (slot_mapping shorter than q/kv) ─────────────────────
 
 

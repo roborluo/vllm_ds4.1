@@ -55,6 +55,11 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    DispatchSpec,
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+)
 from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v41.compressor import DeepseekCompressor
 from vllm.platforms import current_platform
@@ -80,6 +85,80 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+# FlashMLA's mega-attention kernel reads Q chunk-interleaved: per token, 32
+# chunks of [heads, 16] dims, with the padding heads at the tail of every chunk.
+_Q_CHUNK = 16
+# Eager steps of at least this many tokens build that padded Q with
+# _pad_interleaved_q rather than in the fused KV-insert op. The bound is the
+# op's NUM_TOKEN_CUTOFF, from which it runs its reduced-grid kernel; revisit
+# both together.
+_Q_PAD_COPY_MIN_TOKENS = 1024
+
+
+@triton.jit
+def _pad_interleaved_q_kernel(
+    q_ptr,
+    out_ptr,
+    num_rows,
+    LIVE: tl.constexpr,
+    PAD: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    # A row is one (token, 16-dim chunk): its LIVE input elements fill the
+    # first LIVE slots of a LIVE + PAD output row, and the PAD slots get +0.0.
+    pid = tl.program_id(0)
+    rows = pid.to(tl.int64) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS).to(tl.int64)
+    row_mask = rows[:, None] < num_rows
+    cols = tl.arange(0, LIVE)
+    x = tl.load(q_ptr + rows[:, None] * LIVE + cols[None, :], mask=row_mask)
+    out_rows = out_ptr + rows[:, None] * (LIVE + PAD)
+    tl.store(out_rows + cols[None, :], x, mask=row_mask)
+    pad_cols = tl.arange(0, PAD)
+    tl.store(
+        out_rows + LIVE + pad_cols[None, :],
+        tl.zeros([BLOCK_ROWS, PAD], dtype=x.dtype),
+        mask=row_mask,
+    )
+
+
+def _pad_interleaved_q_warmup_inputs(
+    *,
+    live_heads: int,
+    padded_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+) -> dict[str, object]:
+    return dict(
+        q=TritonWarmupTensor(dtype, shape=(1, live_heads, head_dim)),
+        out=TritonWarmupTensor(dtype, shape=(1, padded_heads, head_dim)),
+    )
+
+
+@triton_kernel_dispatcher_with_warmup(
+    kernel=_pad_interleaved_q_kernel,
+    warmup_inputs=_pad_interleaved_q_warmup_inputs,
+)
+def _pad_interleaved_q(q: torch.Tensor, out: torch.Tensor) -> DispatchSpec:
+    """Copy chunk-interleaved ``q`` [N, H, D] into ``out`` [N, HP, D].
+
+    ``out`` gets the layout of the fused KV-insert op's interleaved Q half:
+    each 16-dim chunk holds the H live heads, copied bit for bit, then +0.0 in
+    its HP - H padding slots. Both tensors are dense, and ``16 * H`` and
+    ``16 * (HP - H)`` must be powers of two.
+    """
+    num_tokens, live_heads, head_dim = q.shape
+    padded_heads = out.shape[1]
+    assert out.shape == (num_tokens, padded_heads, head_dim) and out.dtype == q.dtype
+    num_rows = num_tokens * (head_dim // _Q_CHUNK)
+    block_rows = 4
+    return (triton.cdiv(num_rows, block_rows),), dict(
+        num_rows=num_rows,
+        LIVE=live_heads * _Q_CHUNK,
+        PAD=(padded_heads - live_heads) * _Q_CHUNK,
+        BLOCK_ROWS=block_rows,
+        num_warps=4,
+    )
 
 
 def _replace_layer_index(prefix: str, layer_id: int) -> str:
@@ -602,6 +681,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         else:
             self.compressed_cache_prefix = None
 
+        # Large eager steps pad Q with _pad_interleaved_q instead of the fused
+        # op, but only for 32 live heads padded to 64 (e.g. TP2 of a 64-head
+        # model); with 16 or 8 live heads, a chunk's padding width (768 or 896)
+        # is not the power of two the copy's tl.arange needs.
+        self._pads_q_by_copy = (
+            self.accepts_unnormed_unroped_query
+            and self.n_local_heads == 32
+            and self.padded_heads == 64
+            and self.max_num_batched_tokens >= _Q_PAD_COPY_MIN_TOKENS
+        )
+
         if vllm_config.kernel_config.enable_jit_warmup:
             from vllm.v1.attention.backends.mla.sparse_swa import (
                 _COMPUTE_PREFILL_METADATA_KERNEL,
@@ -613,6 +703,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 window_size=self.window_size,
                 block_size=self.swa_cache_layer.block_size,
             )
+
+            if self._pads_q_by_copy:
+                _pad_interleaved_q.register_warmup(
+                    live_heads=self.n_local_heads,
+                    padded_heads=self.padded_heads,
+                    head_dim=self.head_dim,
+                    dtype=vllm_config.model_config.dtype,
+                )
 
             if self.compress_ratio > 1:
                 from vllm.v1.attention.backends.mla.compressor_utils import (
@@ -995,6 +1093,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         attention kernel norms and rotates Q itself and reads it in its own
         chunk-interleaved layout, so the Q half of the launch is a zero-pad to
         ``padded_heads`` -- and nothing at all once the shard is that wide.
+        On large eager steps of a shard ``_pads_q_by_copy`` admits, a second
+        launch, ``_pad_interleaved_q``, writes that pad instead.
         """
         if not isinstance(attn_metadata, dict):
             # Profile run: kernel doesn't fire; produce a padded tensor so
@@ -1041,6 +1141,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 and self.n_local_heads == self.padded_heads
                 else self.padded_heads
             )
+            # Large eager steps take the pad out of the launch and leave it to
+            # _pad_interleaved_q; captured graphs keep the fused pad.
+            copy_q = (
+                self._pads_q_by_copy
+                and q.shape[0] >= _Q_PAD_COPY_MIN_TOKENS
+                and not torch.cuda.is_current_stream_capturing()
+            )
             q_padded = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                 q,
                 kv,
@@ -1048,7 +1155,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 swa_metadata.slot_mapping,
                 positions,
                 cos_sin_cache,
-                pad_to,
+                0 if copy_q else pad_to,
                 self.eps,
                 swa_metadata.block_size,
                 False,  # apply_q_norm: qr is normed before wq_b
@@ -1056,6 +1163,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 not self.accepts_unnormed_unroped_query,  # apply_q_rope
                 self.accepts_unnormed_unroped_query,  # is_q_interleaved
             )
+            if copy_q:
+                out = q.new_empty((q.shape[0], self.padded_heads, q.shape[2]))
+                _pad_interleaved_q(q, out)
+                return out
             return q if pad_to == 0 else q_padded
 
         assert not self.accepts_unnormed_unroped_query, (
