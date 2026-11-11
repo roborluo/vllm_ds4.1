@@ -703,6 +703,13 @@ _SPECULATIVE_DECODING_MODELS = {
         "vllm.models.kimi_k3.nvidia.dspark_mla",
         "K3DSparkForCausalLM",
     ),
+    # [DFlash2-MLA overlay] MLA DFlash2 drafter for Kimi-K3, served under
+    # method="dflash". SpeculativeConfig.hf_config_override prepends this name
+    # (ahead of DFlash2DraftModel) when dflash_config.attention_mode == "mla".
+    "DFlash2K3MLADraftModel": (
+        "vllm.models.kimi_k3.nvidia.dspark_mla",
+        "K3DFlash2MLAForCausalLM",
+    ),
     "MuseSparkDSparkModel": (
         "vllm.models.muse_spark.common.dspark",
         "MuseSparkDSparkForCausalLM",

@@ -1220,6 +1220,37 @@ class SpeculativeConfig:
                 }
             )
 
+        # [DFlash2-MLA overlay] An MLA DFlash2 drafter for Kimi-K3 (e.g.
+        # RadixArk/Kimi-K3.1-Dflash2-Preview) ships as DFlash2DraftModel with
+        # model_type "qwen3" but MLA attention. Route it to the K3 MLA DFlash2
+        # class while keeping DFlash2DraftModel in the list, so the V2 runner and
+        # DFlash2Speculator (selector walk, K+1 bonus-first layout) are still
+        # selected. model_type "deepseek_v2" only marks the draft as MLA
+        # (ModelConfig.use_mla), which keeps decode context parallelism on the
+        # draft as for the K3 DSpark drafter; no hf_config_override branch
+        # matches it, so re-applying this override is a no-op.
+        dflash_config = getattr(hf_config, "dflash_config", None)
+        if (
+            initial_architecture == "DFlash2DraftModel"
+            and hf_config.model_type == "qwen3"
+            and isinstance(dflash_config, dict)
+            and dflash_config.get("attention_mode") == "mla"
+            and getattr(hf_config, "kv_lora_rank", None) is not None
+            and (
+                int(dflash_config.get("conv_kernel_size") or 0) > 0
+                or int(dflash_config.get("selector_rank") or 0) > 0
+            )
+        ):
+            hf_config.model_type = "deepseek_v2"
+            hf_config.update(
+                {"architectures": ["DFlash2K3MLADraftModel", "DFlash2DraftModel"]}
+            )
+            logger.info_once(
+                "DFlash2 MLA drafter detected (dflash_config.attention_mode=mla): "
+                "serving with DFlash2K3MLADraftModel (K3 MLA + block convs + "
+                "candidate selector)."
+            )
+
         return hf_config
 
     @staticmethod
